@@ -1,0 +1,40 @@
+---
+---
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ site.title }}</title>
+  <style>
+    :root { --bg:#fafafa; --card:#fff; --text:#1a1a1a; --muted:#555; --border:#e2e2e2; --accent:#2563eb; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#111; --card:#1b1b1b; --text:#eee; --muted:#aaa; --border:#333; --accent:#60a5fa; }
+    }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:900px; margin:0 auto; padding:48px 16px; }
+    h1 { margin:0 0 4px; }
+    .intro { color:var(--muted); margin:0 0 32px; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:16px; }
+    .card { display:block; padding:20px; background:var(--card); border:1px solid var(--border);
+            border-radius:10px; color:inherit; text-decoration:none; transition:border-color .15s, transform .15s; }
+    .card:hover { border-color:var(--accent); transform:translateY(-2px); }
+    .card h2 { margin:0 0 8px; font-size:1.1rem; color:var(--accent); }
+    .card p { margin:0; color:var(--muted); line-height:1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{ site.title }}</h1>
+    <p class="intro">{{ site.description }}</p>
+    <div class="cards">
+      {% for card in site.data.cards %}
+      <a class="card" href="{{ card.url }}">
+        <h2>{{ card.title }}</h2>
+        <p>{{ card.description }}</p>
+      </a>
+      {% endfor %}
+    </div>
+  </main>
+</body>
+</html>

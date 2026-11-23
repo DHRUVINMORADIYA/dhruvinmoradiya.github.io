@@ -1,2 +1,54 @@
 title: Dhruvin Moradiya
 description: Learning notes, projects and reflections.
+author: Dhruvin Moradiya
+url: https://dhruvinmoradiya.github.io
+baseurl: ""
+
+# Links shown in the header/footer. Leave a value empty to hide it.
+social:
+  github: DHRUVINMORADIYA
+  linkedin: ""   # e.g. your-linkedin-handle
+  email: ""      # e.g. you@example.com
+
+# Posts live in _posts/ and are served at /blog/<slug>/
+permalink: /blog/:title/
+timezone: Asia/Kolkata
+
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+  math_engine: mathjax
+
+# Plugins supported natively by GitHub Pages
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+feed:
+  path: feed.xml
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .jekyll-cache
+  # companion code and data that sit next to drafts
+  - _drafts/*.py
+  - _drafts/*.txt
+  - _drafts/*.pt

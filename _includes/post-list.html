@@ -1,0 +1,12 @@
+<ul class="post-list">
+  {% for post in include.posts %}
+  <li>
+    <a class="post-link" href="{{ post.url | relative_url }}">{{ post.title }}</a>
+    <div class="post-meta">
+      <time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: '%b %-d, %Y' }}</time>
+      {% include reading-time.html content=post.content %}
+    </div>
+    {% if post.description %}<p class="post-summary">{{ post.description }}</p>{% endif %}
+  </li>
+  {% endfor %}
+</ul>

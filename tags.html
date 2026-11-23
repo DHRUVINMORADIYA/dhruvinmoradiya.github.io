@@ -1,0 +1,20 @@
+---
+title: Tags
+permalink: /tags/
+---
+<h1>Tags</h1>
+
+{% assign tags = site.tags | sort %}
+{% if tags.size == 0 %}<p class="muted">No tags yet.</p>{% endif %}
+
+<ul class="tags tag-index">
+  {% for tag in tags %}<li><a href="#{{ tag[0] | slugify }}">{{ tag[0] }} <span class="muted">{{ tag[1].size }}</span></a></li>{% endfor %}
+</ul>
+
+{% for tag in tags %}
+<section class="year" id="{{ tag[0] | slugify }}">
+  <h2>{{ tag[0] }}</h2>
+  {% assign tag_posts = tag[1] %}
+  {% include post-list.html posts=tag_posts %}
+</section>
+{% endfor %}

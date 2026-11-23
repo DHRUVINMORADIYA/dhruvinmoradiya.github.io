@@ -1,0 +1,10 @@
+{% comment %}
+  Shows one window of the big architecture diagram (gpt-architecture.html must appear earlier on the page).
+  Usage: include gpt-crop.html view="x y width height" alt="what it shows" caption="optional caption"
+  "view" is in the big diagram's coordinates.
+  Optional: wide=true lets a large crop break out of the text column.
+{% endcomment %}
+<figure class="diagram diagram-crop{% if include.wide %} diagram-wide{% endif %}">
+<svg class="gp-svg" viewBox="{{ include.view }}" role="img" aria-label="{{ include.alt }}" xmlns="http://www.w3.org/2000/svg"><use href="#gp-art"/></svg>
+{% if include.caption %}<figcaption>{{ include.caption }}</figcaption>{% endif %}
+</figure>

@@ -1,0 +1,760 @@
+---
+title: "How GPT-2 Works: Walking Through a Miniature Model Step by Step"
+description: "How an LLM works during training and inference, walked through on a 4.8M-parameter GPT-2 I built and trained on a laptop."
+tags: [machine-learning, llm, transformers]
+math: true
+---
+
+This is my understanding of how an LLM works, during both training and inference, beyond the jargon and definitions. I walk through every step of GPT-2 using a miniature version I built in Python and trained on a laptop, with real numbers from that model.
+
+## The setup
+
+I came across [llm-visualized.com](https://www.llm-visualized.com/) and went through its GPT-2 model step by step to see what happens underneath. Once that was clear, I started building a miniature version in Python, with the technique and dataset inspired by [Andrej Karpathy](https://github.com/karpathy/ng-video-lecture).
+
+The rule: keep as many steps as possible visible and walkable, so that I can follow any run myself. The one exception is computing the gradients, which PyTorch's autograd does for me. Doing backpropagation by hand for the whole model would be very long, slow and easy to get wrong. To internalize how the chain rule works, I had already done [one full training step by hand](https://github.com/DHRUVINMORADIYA/Learning_ML/blob/main/rough-notes/code/ANN_single_training_step_simulation.py) in an earlier exercise.
+
+### GPT-2 vs. our miniature version
+
+|  | GPT-2 (small) | Ours |
+|---|---|---|
+| Parameters | 124M | 4.8M |
+| Tokens | sub-words (BPE), 50,257 | characters, 65 |
+| Context length | 1,024 tokens | 128 tokens |
+| Vector size per token | 768 | 256 |
+| Layers (transformer blocks) | 12 | 6 |
+| Attention heads per layer | 12 | 4 |
+| Training data | WebText, ~40 GB | TinyShakespeare, ~1 MB |
+| Training hardware | GPUs | a laptop CPU, ~1 hour |
+
+If we zoom out the entire architecture and try to see it as a whole, it is a beautifully created network of pipelines where essence of words can flow. Simple net of pipelines is not enough to extract and use patterns from a complex human language. So, at many places we have placed sponges (weight and bias metrices) that are excellent at absorbing patterns from data. These sponges are basically of same material but their positions in the network and their sizes differ and that's what makes their general function in the network unique.
+
+{% include gpt-architecture.html %}
+
+Now we can go into each step of this architecture. As an example, we follow the prompt "Shakespea" (9 characters) and see how the model predicts the next one.
+
+## 1. Token and position embeddings
+
+{% include gpt-crop.html view="10 60 470 310" alt="The characters of Shakespea become ids, are looked up in the token and position embedding sponges, and are added into one 9×256 stream" caption="Step 1: characters → ids → two lookups → one 9 × 256 stream." %}
+
+Our model has a fixed list of 65 characters, and each one gets a number from 0 to 64. GPT-2 does the same with its 50,257 sub-word pieces.
+
+```python
+chars = sorted(set(text))                     # the vocabulary: every distinct character
+stoi = {ch: i for i, ch in enumerate(chars)}  # string -> integer
+
+def encode(s):
+    return [stoi[c] for c in s]
+```
+
+For our 9 characters:
+
+| position | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| character | S | h | a | k | e | s | p | e | a |
+| id | 31 | 46 | 39 | 49 | 43 | 57 | 54 | 43 | 39 |
+
+### Token embedding
+
+The token embedding matrix $$W_{te}$$ has one row per character in the vocabulary: 65 rows of 256 numbers. Embedding a token means reading its row. "S" has id 31, so its vector is row 31:
+
+$$e_{\text{S}} = W_{te}[31] \qquad (1 \times 256)$$
+
+Doing this for all 9 ids stacks 9 rows into one matrix:
+
+$$\underbrace{E_{tok}}_{9 \times 256} = W_{te}[\,31,\ 46,\ 39,\ 49,\ 43,\ 57,\ 54,\ 43,\ 39\,]$$
+
+```python
+tok_emb = p["wte"][idx]   # (B, T, C)  row lookup: what each token is
+```
+
+$$W_{te}$$ is a learned matrix. We can imagine that after a good training run, every token has a vector of 256 numbers, and tokens with similar meaning sit close to each other in this 256-dimensional space. For GPT-2 these are words and pieces of words. For our characters, these are the closest neighbours of a few vectors in the trained model:
+
+| character | its 5 closest characters |
+|---|---|
+| `a` | `o` `e` `i` `u` `A` |
+| `S` | `D` `T` `N` `X` `C` |
+| `.` | `?` `!` `;` `,` `:` |
+
+Nobody told the model what a vowel or a punctuation mark is. It found the groups by itself, while learning to predict the next character.
+
+The output, $$E_{tok}$$, holds the essence of each token: one 256-number vector per character.
+
+### Position embedding
+
+The token embedding says *what* each character is, but not *where* it is. The two `e`s in "Shakespea" (positions 4 and 7) get exactly the same vector. The model needs to know where each token is, and how far apart two tokens are.
+
+GPT-2 uses a second learned matrix for this, $$W_{pe}$$, with one row per position: 128 rows for us (our context length) and 1,024 for GPT-2. We can imagine it as a supplement to the token embedding matrix. It learns which positions, and which distances between them, make two tokens more or less related. Strictly speaking, each row only says "I am at position $$i$$". The distances are something the model learns to read from these vectors.
+
+This is the same kind of lookup. Positions are simply 0, 1, …, 8, so we take the first 9 rows:
+
+$$E_{pos} = W_{pe}[0{:}9] \qquad (9 \times 256)$$
+
+```python
+pos_emb = p["wpe"][:T]    # (T, C)  first T rows: where each token is
+```
+
+A learned table is not the only option. The original Transformer paper used **sinusoidal** encodings, a fixed formula of sines and cosines with nothing to learn:
+
+$$PE_{(i,\,2k)} = \sin\!\left(\frac{i}{10000^{2k/d}}\right), \qquad PE_{(i,\,2k+1)} = \cos\!\left(\frac{i}{10000^{2k/d}}\right)$$
+
+Most modern LLMs use **RoPE** (rotary position embedding). Instead of adding anything here, it rotates the query and key vectors inside attention, so the attention score depends directly on how far apart two tokens are. Sebastian Raschka's [article on positional embeddings](https://magazine.sebastianraschka.com/p/understanding-positional-embeddings) explains both nicely.
+
+### Adding them together
+
+Finally, we add the two results. For each position $$i$$:
+
+$$x_i = W_{te}[\text{id}_i] + W_{pe}[i] \qquad\Rightarrow\qquad X = E_{tok} + E_{pos} \quad (9 \times 256)$$
+
+For example, the "S" at position 0 becomes $$x_0 = W_{te}[31] + W_{pe}[0]$$.
+
+```python
+value_in_residual_stream = tok_emb + pos_emb   # (B, T, C)
+```
+
+This 9 × 256 matrix goes into the first transformer block. From here on, it is the **residual stream**, the main pipe in the diagram. Every block reads from it and adds its own result back into it.
+
+### During inference vs. during training
+
+If this is an inference run after training, we can say the tokens are now transcribed into a language that only our model can decipher.
+
+If this is a training run, the meaning of each token may not be accurate yet. But PyTorch records how these two sponges changed the raw values of the tokens. So once we calculate the loss and backpropagate, we know how to adjust their weights.
+
+Each row was simply copied into the stream, so its gradient goes straight back to the row it came from. When a token appears more than once, the gradients from its positions add up:
+
+$$\frac{\partial L}{\partial W_{te}[k]} = \sum_{i \,:\, \text{id}_i = k} \frac{\partial L}{\partial x_i}$$
+
+For "Shakespea", row 39 (`a`) collects the gradients from positions 2 and 8, and row 43 (`e`) from positions 4 and 7. Characters that are not in the prompt get nothing from this lookup. In the same way, row $$i$$ of $$W_{pe}$$ gets the gradient of position $$i$$. ($$W_{te}$$ is also reused at the very end of the model, so it gets a second gradient from there. More on that in step 6.)
+
+Running this training loop many times refines the matrices more and more.
+
+## Inside a transformer block
+
+Now we enter the residual stream. It passes through 6 layers (transformer blocks), and each layer has two major subprocesses:
+
+1. attention heads
+2. MLP
+
+{% include gpt-crop.html view="482 48 2766 596" wide=true alt="One transformer block: LayerNorm, four attention heads, output projection and add, then LayerNorm, MLP and add" caption="One transformer block: normalize → attention → add, then normalize → MLP → add. Each part is zoomed in below." %}
+
+After each of them, we return the value to the stream and add it to the latest value in the residual stream. Before each of them, we perform normalization.
+
+Looking at it broadly, every time something is added to the stream, a normalization comes next, so the values never get too big or too small for the next step. In GPT-2, the normalized version goes into the attention heads or the MLP, while the stream itself keeps the raw sum. (The original Transformer normalized the stream itself after each add; GPT-2 moved it to before each step, which trains more stably.) The stream gets normalized directly only once, at the very end.
+
+$$X \leftarrow X + \text{Attention}\big(\text{LN}_1(X)\big) \qquad\qquad X \leftarrow X + \text{MLP}\big(\text{LN}_2(X)\big)$$
+
+```python
+for layer in range(n_layer):
+    # Attention: tokens look at earlier tokens and gather information
+    h = self.layer_norm(value_in_residual_stream, f"h.{layer}.ln_1")  # a copy
+    heads = []
+    for head in range(n_head):
+        heads.append(self.attention_head(h, layer, head))
+    a = torch.cat(heads, dim=-1)
+    a = self.output_projection(a, layer)
+    value_in_residual_stream = value_in_residual_stream + a           # residual add
+
+    # MLP: each token thinks on its own about what it gathered
+    h = self.layer_norm(value_in_residual_stream, f"h.{layer}.ln_2")  # a copy
+    m = self.mlp(h, layer)
+    value_in_residual_stream = value_in_residual_stream + m           # residual add
+
+# once, at the end
+value_in_residual_stream = self.layer_norm(value_in_residual_stream, "ln_f")
+```
+
+## 2. Normalization
+
+{% include gpt-crop.html view="500 135 445 190" alt="LayerNorm: a fixed normalize step, then scale and shift with the learned gamma and beta" caption="Step 2: normalize (fixed math), then scale and shift (learned γ and β)." %}
+
+Let's start with normalization, as it is the first step when we enter a layer, and the same process is repeated later: before the MLP, and once more after the last block. That makes 6 × 2 + 1 = 13 LayerNorms in our model, each with its own learned values.
+
+It has two steps.
+
+### First step: normalize
+
+In the first step, we use the mean and variance to ground all members of a single vector. For example, for the token "S" we have 256 numbers after the first sum. We don't want them to become too big (or too small). So we find each number's distance from the mean and divide it by the standard deviation (the square root of the variance):
+
+$$\mu = \frac{1}{256}\sum_{j=1}^{256} x_j \qquad \sigma^2 = \frac{1}{256}\sum_{j=1}^{256} (x_j - \mu)^2 \qquad \hat{x}_j = \frac{x_j - \mu}{\sqrt{\sigma^2 + \epsilon}}$$
+
+The intuitive sense behind dividing is to make the relative difference count, not the absolute magnitude of the values. For example, 2, 3, 4 are the same as 20, 30, 40 when seen relatively, and the formula gives the same output for both:
+
+| input | mean | variance | output |
+|---|---|---|---|
+| 2, 3, 4 | 3 | 0.67 | −1.22, 0, 1.22 |
+| 20, 30, 40 | 30 | 66.67 | −1.22, 0, 1.22 |
+
+$$\epsilon$$ (epsilon, $$10^{-5}$$ in our code) is just a very tiny value, to avoid division by zero in the worst case.
+
+Each token is normalized on its own, across its own 256 numbers. The 9 tokens don't affect each other here.
+
+Here is what it does to our real "S" vector from step 1, using the trained weights:
+
+|  | first 4 of 256 numbers | mean | standard deviation |
+|---|---|---|---|
+| before | 0.035, −0.051, −0.053, −0.040 | 0.001 | 0.082 |
+| after | 0.408, −0.634, −0.660, −0.507 | 0 | 1 |
+
+In this case the numbers were small, so normalization scaled them *up*. Either way, every token leaves this step at the same scale.
+
+```python
+mean = x.mean(dim=-1, keepdim=True)                 # (B, T, 1)  average of each token
+var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)  # (B, T, 1)  their spread
+x_hat = (x - mean) / torch.sqrt(var + eps)          # (B, T, C)  mean 0, variance 1
+```
+
+### Second step: scale and shift
+
+Then comes scaling and shifting, using gamma ($$\gamma$$) and beta ($$\beta$$). These two are learned (sponges in the diagram), 256 numbers each, and every normalization block has its own pair.
+
+$$y_j = \gamma_j \, \hat{x}_j + \beta_j \qquad\qquad \underbrace{\hat{X}}_{9 \times 256} \odot \underbrace{\gamma}_{256} + \underbrace{\beta}_{256} = \underbrace{Y}_{9 \times 256}$$
+
+The intuition behind it: the normalization step we just saw relies completely on the incoming values and fixed math. There is no influence from our model. Gamma and beta let the model learn how to adjust the result of that step, per channel. This makes normalization dynamic and data-driven.
+
+They start at $$\gamma = 1$$ and $$\beta = 0$$, which changes nothing, and training decides from there. In our trained first LayerNorm, $$\gamma$$ ended up between 0.87 and 1.15, and $$\beta$$ between −0.06 and 0.06.
+
+```python
+gamma = self.params[name + ".gamma"]   # (C,)  scale, starts at 1
+beta = self.params[name + ".beta"]     # (C,)  shift, starts at 0
+...
+return x_hat * gamma + beta            # (B, T, C)  learned scale and shift per channel
+```
+
+## 3. Attention head
+
+{% include gpt-crop.html view="880 140 880 455" alt="The normalized 9×256 input goes to all 4 heads. Head 1 opened up: W_q, W_k and W_v make q, k and v, then scores, causal mask, softmax and weights @ v give 9×64" caption="Step 3: the same input goes to all 4 heads. Inside each one: q, k, v → scores → mask → softmax → weights @ v." %}
+
+Once normalization is done, we are ready to send the values to the attention heads. We have kept 4 heads in a layer, while GPT-2 has 12. We pass the same value (shape 9 × 256) into each of them, collect a 9 × 64 output from each at the end, concatenate them side by side (4 × 64 = 256), and move ahead.
+
+```python
+heads = []
+for head in range(n_head):
+    heads.append(self.attention_head(h, layer, head))   # each (B, T, 64)
+a = torch.cat(heads, dim=-1)                              # (B, T, 256)
+```
+
+Now let's go into a head.
+
+### Q, K and V
+
+As soon as the values enter the head, they meet three sponges: $$W_q$$, $$W_k$$ and $$W_v$$. Every head has its own three, and each learns its own way. We do a matrix multiplication, add a bias, and now we have three 9 × 64 matrices:
+
+$$Q = XW_q + b_q \qquad K = XW_k + b_k \qquad V = XW_v + b_v$$
+
+$$\underbrace{X}_{9 \times 256} \; @ \; \underbrace{W}_{256 \times 64} \; = \; (9 \times 64)$$
+
+```python
+q = x @ p[a + "q.weight"] + p[a + "q.bias"]   # (B, T, hs)  looking for
+k = x @ p[a + "k.weight"] + p[a + "k.bias"]   # (B, T, hs)  contains
+v = x @ p[a + "v.weight"] + p[a + "v.bias"]   # (B, T, hs)  passes on
+```
+
+I imagine the tokens being squeezed into a lower-dimensional space, 256 → 64, by learned matrices that learn their function over training.
+
+A common way to put it: the query is what a token is *looking for*, and the key is what a token *contains*. Over training, $$W_q$$ and $$W_k$$ learn to place a token's query close to the keys of the tokens it should pay attention to. Close means their positions in the 64-dimensional space are near each other, so their dot product is higher.
+
+### Scores: every token meets every other token
+
+Keeping that in mind, we take the dot product of $$Q$$ with the transpose of $$K$$. This is the very center of the attention mechanism: each token of our prompt gets a chance to meet all the other tokens.
+
+$$\text{scores} = Q K^{\top} \qquad\quad \underbrace{Q}_{9 \times 64} @ \underbrace{K^{\top}}_{64 \times 9} = (9 \times 9)$$
+
+The result is a 9 × 9 matrix, where the cell at (row $$i$$, column $$j$$) says how much the token at position $$i$$ cares about the token at position $$j$$.
+
+Here is the real one from our trained model (block 3, head 4), before any scaling or masking. Every cell is filled: every token has met every other token, even the ones that come after it.
+
+| looking from ↓ at → | S | h | a | k | e | s | p | e | a |
+|---|---|---|---|---|---|---|---|---|---|
+| **S** | −14 | −36 | −25 | −38 | −62 | −52 | −53 | −66 | −52 |
+| **h** | −36 | −49 | −52 | −66 | −68 | −70 | −65 | −65 | −66 |
+| **a** | −41 | −54 | −42 | −63 | −77 | −71 | −74 | −80 | −69 |
+| **k** | −20 | −26 | −17 | −24 | −37 | −37 | −38 | −37 | −33 |
+| **e** | −51 | −55 | −35 | −42 | −47 | −61 | −73 | −60 | −54 |
+| **s** | −46 | −55 | −30 | −41 | −55 | −61 | −68 | −64 | −54 |
+| **p** | −47 | −56 | −31 | −44 | −55 | −51 | −45 | −48 | −29 |
+| **e** | −50 | −52 | −25 | −52 | −57 | −63 | −58 | −54 | −34 |
+| **a** | −56 | −66 | −47 | −69 | −76 | −77 | −71 | −69 | −49 |
+
+Only the differences within a row matter. The softmax later turns them into percentages, so it doesn't matter that all the values here are negative.
+
+In a well-trained model, we could expect the cell (Mozart, piano) to have a higher value than (Mozart, guitar). But we can't say this with certainty, because there are 144 attention heads in GPT-2 (12 layers × 12 heads; ours has 6 × 4 = 24), and each one learns to look for something different.
+
+### Scaling by √64
+
+Once we have the 9 × 9 matrix, we divide all values by $$\sqrt{d}$$, where $$d$$ is the dimension inside the head: 64. This stops the values from exploding.
+
+Going a bit deeper into the math: each score is a sum of 64 products. If the numbers in $$q$$ and $$k$$ have a variance of about 1, the sum of 64 such products has a variance of about 64, so a standard deviation of about 8. Dividing by $$\sqrt{64} = 8$$ brings it back to about 1.
+
+$$\text{scores} = \frac{Q K^{\top}}{\sqrt{64}}$$
+
+This keeps the softmax that comes next sane. Here is the last row of one head in our trained model (block 1, head 1), before and after dividing by 8:
+
+|  | S | h | a | k | e | s | p | e | a |
+|---|---|---|---|---|---|---|---|---|---|
+| raw score | −34.7 | −44.0 | −41.5 | −35.4 | −40.6 | −41.2 | −36.4 | −37.2 | −35.9 |
+| softmax, without ÷ 8 | 48% | 0% | 0% | 24% | 0% | 0% | 9% | 4% | 15% |
+| softmax, with ÷ 8 | 17% | 5% | 7% | 15% | 8% | 7% | 14% | 12% | 14% |
+
+Without the scaling, a few tokens take almost everything, and the rest get almost no attention (and almost no gradient to learn from).
+
+### Causal mask
+
+Next, we apply the causal mask: we suppress every cell where a token would be looking at a future token to gather information. The reason: this is a next-token prediction machine, where a new token is generated based on the past ones. A token shouldn't be allowed to gather any information from the tokens that are yet to come.
+
+We replace those values with $$-\infty$$. This is the mathematical way of suppressing them: in the softmax that comes next, $$e^{-\infty} = 0$$, so their contribution becomes exactly zero.
+
+$$\text{scores}_{ij} = -\infty \quad \text{for } j > i$$
+
+The same head after dividing by 8 and masking. Everything above the diagonal is now $$-\infty$$:
+
+| looking from ↓ at → | S | h | a | k | e | s | p | e | a |
+|---|---|---|---|---|---|---|---|---|---|
+| **S** | −1.8 | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ |
+| **h** | −4.4 | −6.1 | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ |
+| **a** | −5.1 | −6.8 | −5.2 | −∞ | −∞ | −∞ | −∞ | −∞ | −∞ |
+| **k** | −2.5 | −3.2 | −2.1 | −3.0 | −∞ | −∞ | −∞ | −∞ | −∞ |
+| **e** | −6.4 | −6.8 | −4.4 | −5.2 | −5.9 | −∞ | −∞ | −∞ | −∞ |
+| **s** | −5.7 | −6.8 | −3.8 | −5.1 | −6.8 | −7.6 | −∞ | −∞ | −∞ |
+| **p** | −5.8 | −7.0 | −3.8 | −5.5 | −6.9 | −6.4 | −5.6 | −∞ | −∞ |
+| **e** | −6.3 | −6.5 | −3.1 | −6.5 | −7.1 | −7.9 | −7.3 | −6.8 | −∞ |
+| **a** | −7.0 | −8.2 | −5.8 | −8.7 | −9.4 | −9.6 | −8.9 | −8.6 | −6.1 |
+
+```python
+scores = q @ k.transpose(-2, -1) / math.sqrt(head_size)    # (B, T, T)
+# lower triangle = allowed
+mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+scores = scores.masked_fill(~mask, float("-inf"))
+```
+
+### Softmax
+
+Next is the softmax. It works on each row separately, and turns that row's scores into percentages that add up to 100%. The higher the score, the bigger the share. So each row becomes one token's attention, divided among the tokens it is allowed to see. The masked cells get exactly 0%.
+
+In our table, row "h" has the scores −4.4 (for S) and −6.1 (for itself), and these become 84% and 16%. In the same way, we could say that Mozart gives 99% of its attention to piano and 1% to guitar. (More on softmax in these [notes on classification](https://dhruvinmoradiya.github.io/Learning_ML/permanent-notes/02-linear-neural-network-for-classification/Notes.html#softmax).)
+
+$$w_{ij} = \frac{e^{\,\text{scores}_{ij}}}{\sum_{j'} e^{\,\text{scores}_{ij'}}}$$
+
+```python
+weights = self.softmax(scores)   # (B, T, T)  each row sums to 1
+```
+
+For our Shakespeare example, the output is a 9 × 9 matrix where each row is one token's attention distribution, in percent. Here it is for the same head (block 3, head 4):
+
+| looking from ↓ at → | S | h | a | k | e | s | p | e | a |
+|---|---|---|---|---|---|---|---|---|---|
+| **S** | 100 | | | | | | | | |
+| **h** | 84 | 16 | | | | | | | |
+| **a** | 48 | 9 | 43 | | | | | | |
+| **k** | 29 | 14 | 41 | 17 | | | | | |
+| **e** | 7 | 5 | 53 | 24 | 12 | | | | |
+| **s** | 9 | 3 | 65 | 18 | 3 | 1 | | | |
+| **p** | 8 | 2 | 60 | 12 | 3 | 5 | 10 | | |
+| **e** | 4 | 3 | 85 | 3 | 2 | 1 | 1 | 2 | |
+| **a** | 14 | 4 | 42 | 3 | 1 | 1 | 2 | 3 | 32 |
+
+The empty upper triangle is the causal mask at work. "S" can only look at itself, so it gives itself 100%. And once the first "a" appears, almost every later character looks at it. Why this head learned that, we can only guess.
+
+### Multiplying by V
+
+Now this is good knowledge: we know much more about the tokens' relationships with each other. But we can't pass on this 9 × 9 matrix of percentages as it is. It only says *how much* each token looks at the others, not *what* it should take from them. Its size also depends on the prompt length, while the stream needs one vector per token. That's where we bring in the third matrix from this attention head: $$V$$. We multiply the attention weights with $$V$$, and receive the final output of this attention head (9 × 64):
+
+$$\text{out} = w\,V \qquad\quad \underbrace{w}_{9 \times 9} @ \underbrace{V}_{9 \times 64} = (9 \times 64) \qquad\quad \text{out}_i = \sum_{j} w_{ij}\, v_j$$
+
+So each token's output is a mix of the value vectors of the tokens it can see, weighted by its row of percentages. For example, the final "a" takes 42% of the first "a"'s value vector, 32% of its own, and smaller amounts of the rest.
+
+Numbering the positions 0 to 8, the final "a" is position 8 and the first "a" is position 2. Using its row from the softmax table:
+
+$$\text{out}_8 = 0.14\, v_0 + 0.04\, v_1 + \mathbf{0.42}\, v_2 + 0.03\, v_3 + \dots + \mathbf{0.32}\, v_8$$
+
+```python
+return weights @ v   # (B, T, hs)  weighted average of the values
+```
+
+I personally find it hard to fully understand what knowledge $$W_v$$ and its bias learn. One way to see it: $$Q$$ and $$K$$ decide *where* to look, and $$V$$ decides *what* is picked up from there. I imagine it as a third matrix, independent of $$Q$$ and $$K$$, that also learns patterns in collaboration with them. They have no direct connection in the forward pass, but during backpropagation they do: the gradient reaching $$V$$ depends on the attention weights that $$Q$$ and $$K$$ produced, and the gradient reaching $$Q$$ and $$K$$ depends on the values in $$V$$. Over training, this makes their combined function more robust and coupled.
+
+## 4. Output projection
+
+{% include gpt-crop.html view="1760 95 450 280" alt="The 4 heads' 9×64 outputs are concatenated into 9×256, multiplied by the learned output projection matrix, and added back to the residual stream" caption="Step 4: concat the 4 heads, mix them with one learned matrix, add the result to the stream." %}
+
+We now have four 9 × 64 matrices, one from each attention head. Each row represents a token, now with a little more context about its place in the entire prompt. Hypothetically, if the prompt contains "Rachel Green", the model understands better that "Green" refers to Rachel's last name and not the colour green. Although we can't point to the head where this knowledge was gained. It's more like the combined effort of all the heads, in all the layers, that makes it happen.
+
+### Concatenate
+
+First, we simply concatenate the outputs of all 4 heads side by side, which brings us back to the original shape of 9 × 256:
+
+$$\text{concat}\big(\underbrace{H_1}_{9 \times 64},\ H_2,\ H_3,\ H_4\big) = \underbrace{A}_{9 \times 256}$$
+
+```python
+a = torch.cat(heads, dim=-1)   # (B, T, 256)  heads side by side
+```
+
+At this point, the heads still haven't talked to each other. Columns 0–63 come only from head 1, columns 64–127 only from head 2, and so on.
+
+### Project
+
+Next, we have one more learned matrix, $$W_O$$ (with its bias), that transforms this result again. The transformation doesn't change the shape:
+
+$$\underbrace{A}_{9 \times 256} \; @ \; \underbrace{W_O}_{256 \times 256} + \underbrace{b_O}_{256} \; = \; (9 \times 256)$$
+
+```python
+def output_projection(self, a, layer):
+    W = self.params[f"h.{layer}.attn.c_proj.weight"]   # (C, C)
+    b = self.params[f"h.{layer}.attn.c_proj.bias"]     # (C,)
+    return a @ W + b                                   # (B, T, C)
+```
+
+We can see it as mixing the concatenated values. Each of the 256 output numbers is a weighted sum of *all* 256 input numbers:
+
+$$\text{out}_{i,c} = \sum_{k=1}^{256} A_{i,k}\, W_{O\,k,c} + b_{O\,c}$$
+
+So every output number can draw from all 4 heads at once. This is where the heads' findings get combined.
+
+Like the scale and shift in normalization, we rely on a learned matrix for this task, rather than on pure math. It makes the entire model more connected. We let the data drive the transformation, but we also give the model the power and the chance to learn. Here, after the heads' results are concatenated in each layer, the learned matrix works out how to transform them best, so that their contribution moves the whole model closer to the expected result.
+
+### Add to the residual stream
+
+Once the final 9 × 256 matrix is ready, we merge it into the residual stream. Note that we are not replacing the initial value with this new, richer value. We are adding it to the value in the residual stream:
+
+$$X \leftarrow X + A\,W_O + b_O$$
+
+```python
+value_in_residual_stream = value_in_residual_stream + a   # residual add
+```
+
+At the end of this step, we have completed the first half of a layer, which also happens to be the core, most complex part of an attention-based LLM.
+
+## 5. MLP
+
+{% include gpt-crop.html view="2196 95 1030 245" wide=true alt="Residual stream → LayerNorm 2 → MLP: expand 9×256 to 9×1024 with W_up, apply GELU, project back to 9×256 with W_down, and add to the residual stream" caption="Step 5: from the stream, normalize, expand 256 → 1,024, GELU, shrink back to 256, add back to the stream." %}
+
+Now we move to the second part of the layer: the MLP. It is a bit easier and more straightforward than the attention part.
+
+### Normalization again
+
+We start with normalization. It is the same as the previous one, except that it has its own γ and β. Again, the intuition is to normalize after an operation (here, adding the attention output to the stream) where there is a chance of the values exploding or vanishing.
+
+```python
+h = self.layer_norm(value_in_residual_stream, f"h.{layer}.ln_2")   # (B, T, C)
+```
+
+### Expand, GELU, shrink
+
+Once the output is out, we enter the MLP block. An MLP is simply a fully connected neural network. Ours has one hidden layer, with two weight matrices around it:
+
+1. $$W_{up}$$ expands the dimension to 4 times the original: 256 → 1,024 (GPT-2: 768 → 3,072).
+2. GELU, the activation function GPT-2 uses, is applied to every number.
+3. $$W_{down}$$ shrinks the dimension back to the original: 1,024 → 256.
+
+$$\underbrace{X}_{9 \times 256} \; @ \; \underbrace{W_{up}}_{256 \times 1024} + b_{up} = \underbrace{H}_{9 \times 1024}$$
+
+$$\text{GELU}(H) \; @ \; \underbrace{W_{down}}_{1024 \times 256} + b_{down} = (9 \times 256)$$
+
+```python
+def mlp(self, x, layer):
+    p = self.params
+    # expand: (B, T, C) -> (B, T, 4C)
+    h = x @ p[f"h.{layer}.mlp.c_fc.weight"] + p[f"h.{layer}.mlp.c_fc.bias"]
+    # non-linearity
+    h = self.gelu(h)
+    # project back: (B, T, 4C) -> (B, T, C)
+    return h @ p[f"h.{layer}.mlp.c_proj.weight"] + p[f"h.{layer}.mlp.c_proj.bias"]
+```
+
+GELU (Gaussian Error Linear Unit) is built on a probability idea. It multiplies each value by the probability that a standard normal random variable is smaller than it:
+
+$$\text{GELU}(x) = x \cdot \Phi(x) \qquad \Phi(x) = P(Z \le x), \quad Z \sim \mathcal{N}(0, 1)$$
+
+We can read it as: keep $$x$$ with a weight equal to how likely it is to be "big" compared to typical values. A large positive value has $$\Phi(x) \approx 1$$, so it passes almost unchanged. A large negative value has $$\Phi(x) \approx 0$$, so it is dropped. Values near zero are partly kept: $$\text{GELU}(0.5) \approx 0.5 \times 0.69 = 0.35$$, and $$\text{GELU}(-0.5) \approx -0.5 \times 0.31 = -0.15$$.
+
+So it behaves like a smooth version of ReLU, which would keep 0.5 as it is and cut −0.5 to exactly 0.
+
+{% include relu-gelu.html %}
+
+GPT-2 (and our code) computes $$\Phi$$ with a faster tanh approximation, which gives almost the same numbers:
+
+$$\text{GELU}(x) \approx 0.5\,x\left(1 + \tanh\!\left(\sqrt{2/\pi}\,\big(x + 0.044715\,x^3\big)\right)\right)$$
+
+It is also what makes the expansion worth doing. Without it, the two matrices would collapse into a single matrix ($$W_{up} W_{down}$$), and the 1,024 numbers in the middle would add nothing.
+
+Then, as before, the result is added to the residual stream:
+
+```python
+value_in_residual_stream = value_in_residual_stream + m   # residual add
+```
+
+### What the MLP does
+
+We can imagine this step as giving each token, now rich with context, more room to express itself. Note that the tokens are not looking at each other here. The same $$W_{up}$$ and $$W_{down}$$ are applied to each of the 9 rows separately. Attention is where tokens talk to each other; the MLP is where each token thinks on its own about what it gathered.
+
+Again, we can't say that a certain MLP block in a certain layer finds a certain pattern. Rather, each layer's MLP contributes a little, and the next layers build on that incremental effort.
+
+The MLPs take about 2/3 of the parameters in every layer:
+
+|  | MLP parameters per layer | share of the layer | share of the whole model |
+|---|---|---|---|
+| Ours | 525,568 | 67% | 66% |
+| GPT-2 | 4,722,432 | 67% | 46% |
+
+(GPT-2's share of the whole model is lower because its token embedding table alone holds 38.6M parameters.)
+
+So they are responsible for much of an LLM's richness. They are also the parts where, with some certainty, we can say facts are being stored (not literally, at a single step).
+
+### Superposition
+
+The idea of superposition, from [3Blue1Brown's video on how LLMs might store facts](https://www.youtube.com/watch?v=9-Jl0dxWQs8), is especially important here.
+
+Each of the 3,072 hidden numbers in GPT-2's MLP is one neuron. Each neuron has a direction in the 768-dimensional space (its row of $$W_{up}$$), and asks: "how much does this token point in my direction?" When it fires, it writes its own direction (its column of $$W_{down}$$) back into the stream.
+
+If every concept needed its own exactly perpendicular direction, 768 dimensions could hold only 768 concepts. But if *nearly* perpendicular is good enough, we can fit far more. For example, in our 256-dimensional space, 10,000 directions can all sit between about 70° and 110° of each other. In GPT-2's 768 dimensions, they all sit between about 80° and 100°. And the number of such nearly perpendicular directions grows exponentially as the dimension grows.
+
+This is superposition: a model can hold many more meanings than it has dimensions. It is one explanation for why large models perform so unexpectedly well: they seem to know far more than their number of dimensions alone would suggest. The price is that concepts don't line up with single neurons. One concept is spread over a combination of neurons, and one neuron reacts to several concepts.
+
+This is what makes it so hard to look inside a model and say what it knows. The field that tries to do exactly that is **mechanistic interpretability**: it reverse-engineers these mixed combinations back into concepts humans can read.
+
+### Repeating the layer
+
+The MLP returns a 9 × 256 matrix that is ready to be merged into the residual stream, and with that, we have completed a single layer.
+
+In our miniature GPT, this layer is repeated 6 times. GPT-2 has 12 layers, and later models have more and more: GPT-3, for example, has 96. Each layer has its own set of sponges.
+
+Each layer receives the original token + position embeddings, along with the knowledge added by every layer before it. We can imagine each layer adding its own knowledge on top of the previous layer's output, in two ways:
+
+- **attention** transfers knowledge between tokens;
+- the **MLP** decodes more meaning within each token, on its own.
+
+## 6. Unembedding
+
+{% include gpt-crop.html view="3250 60 790 180" alt="Final LayerNorm, then the unembedding: the normalized 9×256 matrix is multiplied by the transposed token embedding matrix, giving 9×65 logits, and the last row is kept" caption="Step 6a: normalize one last time, compare with every token (wteᵀ) → logits → keep the last row." %}
+
+Now we reach the unembedding part of the network.
+
+### Final normalization
+
+We first normalize, the same as before, with one last pair of $$\gamma$$ and $$\beta$$. This gives us the final 9 × 256 matrix, where each row is a context-rich representation of its token.
+
+```python
+value_in_residual_stream = self.layer_norm(value_in_residual_stream, "ln_f")
+```
+
+### Logits: comparing with every token
+
+Next, we take the dot product of each row with every token in our vocabulary: 65 characters in our case, 50,257 sub-word tokens in GPT-2. The result is one score per token, called a **logit**. It is not a probability distribution yet, but the highest logits go to the most probable next tokens.
+
+We can imagine the 256 values of a row as a point in the 256-dimensional space. When we compare it with every token in the unembedding matrix, the token whose vector points most in the same direction gets the highest value.
+
+$$\text{logits} = X\,W_{te}^{\top} \qquad\quad \underbrace{X}_{9 \times 256} \; @ \; \underbrace{W_{te}^{\top}}_{256 \times 65} = (9 \times 65)$$
+
+```python
+def unembed(self, x):
+    return x @ self.params["wte"].T   # (B, T, C) @ (C, V) -> (B, T, V)
+```
+
+The unembedding matrix is the same token embedding matrix we used at the beginning, transposed, because we are doing the reverse of what we did there: going from vectors back to tokens. This is called **weight tying**, and GPT-2 (and our code) uses it, so this step adds no new parameters. The two can also be separate learned matrices, which we see in many other models.
+
+### Why the last row?
+
+Every row predicts the token that comes *after* its own position. Thanks to the causal mask, row $$i$$ has only seen the tokens up to $$i$$, so it can't cheat by looking at the answer.
+
+During **training**, we use all 9 rows: the loss is calculated at every position, so one sequence of 9 characters gives 9 predictions to learn from. Here is what our trained model predicts at each position:
+
+| the model has seen | correct next | model's top guess |
+|---|---|---|
+| S | h | `:` 21% |
+| Sh | a | `a` 42% |
+| Sha | k | `l` 91% (as in "Shall") |
+| Shak | e | `e` 99% |
+| Shake | s | space 56% |
+| Shakes | p | space 53% |
+| Shakesp | e | `u` 44% |
+| Shakespe | a | `d` 32% |
+| Shakespea | r | `r` 93% |
+
+During **inference**, only the last row matters. It has seen the whole prompt, so it has the most context, and it is the only one predicting a character we don't know yet.
+
+```python
+logits = logits[:, -1, :]   # (B, vocab_size)  last position only
+```
+
+### From logits to a choice
+
+{% include gpt-crop.html view="4055 62 460 128" alt="Softmax turns the last row of logits into probabilities; r gets 92.8% and is picked" caption="Step 6b: softmax → probabilities → pick the next character." %}
+
+Now that we have logits for all tokens, we have a good idea of which token has the highest value and which are the next available options.
+
+The **greedy** decoding method simply takes the token with the highest value. However, real models usually go one step further: they convert the logits into a probability distribution using softmax (more on softmax in these [notes](https://dhruvinmoradiya.github.io/Learning_ML/permanent-notes/02-linear-neural-network-for-classification/Notes.html#softmax)), and pick the token according to those probabilities.
+
+$$p_i = \frac{e^{z_i}}{\sum_{j=1}^{65} e^{z_j}}$$
+
+For example, for "The capital of Canada is …": Ottawa 99%, Toronto 1%. It's like rolling a dice with 100 faces and picking the token accordingly. This means there is also a 1% chance that we wrongly pick Toronto.
+
+For "Shakespea", our model gives:
+
+| r | k | c | s | d |
+|---|---|---|---|---|
+| 92.8% | 3.6% | 1.3% | 0.7% | 0.6% |
+
+```python
+probs = self.softmax(logits)   # (B, vocab_size)  scores -> probabilities
+next_id = self.sample(probs)   # (B, 1)           pick one token
+```
+
+### Temperature
+
+There is also the concept of **temperature**, $$T$$. Before the softmax, we divide every logit by it:
+
+$$p_i = \frac{e^{z_i / T}}{\sum_{j} e^{z_j / T}}$$
+
+A temperature above 1 flattens the distribution, pushing the probabilities of the other options up. A temperature below 1 sharpens it towards the top choice, and as $$T$$ approaches 0, it becomes greedy decoding. Here is the same "Shakespea" prediction at different temperatures:
+
+| temperature | r | k | c |
+|---|---|---|---|
+| 0.5 | 99.8% | 0.1% | 0.0% |
+| 1 (our code) | 92.8% | 3.6% | 1.3% |
+| 1.5 | 72.2% | 8.3% | 4.3% |
+| 2 | 49.0% | 9.6% | 5.9% |
+
+We can think of it like this: a low temperature makes the output more like a formal report, and nudging it up makes it more creative. Too high, and the text turns into nonsense.
+
+This is the end of a single run over a transformer-based LLM.
+
+## A typical inference cycle
+
+The forward pass we just walked through is the same for training and inference. During inference, we take the output token, append it to the original prompt, give it back to the same model, and repeat:
+
+```python
+def generate(self, idx, max_new_tokens):
+    with torch.no_grad():                           # no gradients needed for inference
+        for _ in range(max_new_tokens):
+            context = idx[:, -block_size:]          # only the last 128 tokens fit
+            logits = self.forward(context)          # (B, T, vocab_size)
+            logits = logits[:, -1, :]               # the last position predicts the next token
+            probs = self.softmax(logits)            # scores -> probabilities
+            next_id = self.sample(probs)            # pick one token
+            idx = torch.cat([idx, next_id], dim=1)  # append it and repeat
+    return idx
+```
+
+Note `idx[:, -block_size:]`: once the text is longer than 128 characters (1,024 tokens for GPT-2), the model only sees the most recent part.
+
+### How does it answer questions, and know when to stop?
+
+The question that came to me: it's great that we have this sophisticated, well-designed architecture that gets better and better at predicting the next token with training. But how does it respond to a question like "What is the meaning of x?", or a simple prompt like "Write a poem"? And how does it know when to stop?
+
+The main training process is self-supervised learning: the text itself provides the answers. The additional capabilities, which need something more than just predicting the next token, come from **post-training**. In supervised fine-tuning, we feed the model prompts together with ideal responses, to teach it how to respond in all these cases. This is usually followed by learning from human preferences (for example, RLHF), where the model learns which of its own answers people prefer.
+
+To detect the end of an answer, we use a dedicated token, for example `<|endoftext|>` in GPT-2. It is treated just like any other token, in the embeddings, in training and in the predictions. When the model predicts it, we simply stop the append-and-repeat loop. Our character-level model has no such token, so it simply stops after `max_new_tokens` characters.
+
+## A typical training cycle
+
+In a training run, we already know the correct next character at every position. We take 32 random chunks of 128 characters from the text, and the target `y` is the same chunk shifted by one character:
+
+```python
+x, y = get_batch("train")   # (32, 128), (32, 128)
+# y[b, t] is the character right after x[b, t]
+```
+
+So one step gives 32 × 128 = 4,096 predictions to learn from.
+
+### Forward pass
+
+The 32 chunks of 128 characters go through the same forward run we just walked through, side by side. At the end, every one of the 128 characters has its final 256 values. Their dot product with the unembedding matrix gives 65 logits per position: one score for every character in the vocabulary.
+
+```python
+logits = model.forward(x)   # (32, 128, 65)
+```
+
+Unlike inference, we keep all positions, not only the last one. Each position has its own correct answer in `y`.
+
+### Loss
+
+Once we have the logits, for each of the 4,096 positions (32 chunks × 128 characters) we:
+
+1. take the softmax of its 65 logits, to get a probability distribution over the vocabulary;
+2. take the $$-\log$$ of the probability assigned to the correct character (from `y`);
+3. average this over all positions. This is the cross-entropy loss, as discussed in these [notes](https://dhruvinmoradiya.github.io/Learning_ML/permanent-notes/02-linear-neural-network-for-classification/Notes.html#cross-entropy).
+
+Doing the softmax and the log separately is risky: the exponentials can become too large, or the probabilities too small, for the computer to represent accurately. The **logsumexp** formula combines both steps into one, so we safely get the log-probabilities directly (more on it [here](https://dhruvinmoradiya.github.io/Learning_ML/permanent-notes/02-linear-neural-network-for-classification/Notes.html#softmax-revisited-logsumexp)).
+
+```python
+def cross_entropy(logits, targets):
+    B, T, V = logits.shape
+    logits = logits.reshape(B * T, V)    # one row per position
+    targets = targets.reshape(B * T)     # its correct character
+
+    # softmax and log in one step (logsumexp)
+    m = logits.max(dim=1, keepdim=True).values
+    z = logits - m                       # largest logit of each row is now 0
+    log_probs = z - torch.log(torch.exp(z).sum(dim=1, keepdim=True))
+
+    correct = log_probs[torch.arange(B * T), targets]   # pick the correct character
+    return -correct.mean()                               # minus the mean
+```
+
+For "Shakespea", the model gives `r` 92.8%, so that position adds $$-\log 0.928 = 0.074$$. A confident, correct prediction adds almost nothing; a confident, wrong one adds a lot.
+
+### Where the gradient starts: $$\hat{y} - y$$
+
+The loss we calculated above is one number for the whole batch. It is useful for logging and monitoring: we watch it go down as the model learns. But to train, we need something more specific: for every logit, in which direction should it move to lower the loss, and by how much?
+
+At every position, our model is simply a 65-class classifier: 65 logits, a softmax, and cross-entropy against one correct character. When softmax and cross-entropy are combined, their derivative compresses into a very simple formula (derived in these [notes](https://dhruvinmoradiya.github.io/Learning_ML/permanent-notes/02-linear-neural-network-for-classification/Notes.html#cross-entropy)):
+
+$$\frac{\partial L}{\partial z_j} = \frac{1}{N}\left(\hat{y}_j - y_j\right)$$
+
+What each element means, for one position:
+
+- $$z_j$$ is the logit (score) of character $$j$$, where $$j$$ goes over all 65 characters.
+- $$\frac{\partial L}{\partial z_j}$$ is the gradient: how much the loss changes if that logit goes up a little. A negative value means raising the logit lowers the loss.
+- $$\hat{y}_j$$ is the probability the model gave to character $$j$$, after the softmax.
+- $$y_j$$ is 1 if $$j$$ is the correct character, and 0 for the other 64. The code never builds this; it only has the correct character's id in `y`.
+- $$N$$ is the number of positions the loss is averaged over: 4,096 in a batch. Each position contributes $$\frac{1}{N}$$ of the mean, so its gradient is scaled by the same factor.
+
+For example, take the last position of "Shakespea", where the correct next character is `r`. Leaving out the $$\frac{1}{N}$$:
+
+| character $$j$$ | $$\hat{y}_j$$ | $$y_j$$ | $$\hat{y}_j - y_j$$ |
+|---|---|---|---|
+| r | 0.928 | 1 | −0.072 |
+| k | 0.036 | 0 | +0.036 |
+| c | 0.013 | 0 | +0.013 |
+| s | 0.007 | 0 | +0.007 |
+
+- For `r`, the gradient is negative, so moving against it pushes the logit of `r` up. The push is small, because the model was already 92.8% sure.
+- For every other character, it is positive, so their logits get pushed down, each by as much probability as it wrongly received.
+- If the model had given `r` only 10%, its gradient would be $$0.1 - 1 = -0.9$$: a much bigger push. The more wrong the prediction, the bigger the correction.
+
+We never write this formula in our code. `loss.backward()` lets autograd differentiate through our `cross_entropy` code, and it arrives at exactly these numbers. This is only the first step: from the logits, the gradient still has to travel back through the rest of the model.
+
+### Backpropagation
+
+From the logits, the gradient has to travel back through the whole model: the unembedding, the 6 layers, and down to the embeddings. This is the chain rule applied many times over. Here is [one training step done by hand](https://github.com/DHRUVINMORADIYA/Learning_ML/blob/main/rough-notes/code/ANN_single_training_step_simulation.py) for a small network.
+
+In PyTorch, this is done by **autograd**. During the forward pass, it records every calculation and how to take its derivative. `loss.backward()` walks this record backwards, applies the chain rule, and fills `w.grad` for every learned matrix (sponge): how a small change in that weight would change the loss.
+
+### Updating the weights
+
+Now every weight has a gradient, and the **optimizer** uses it to change the weight. The simplest version is plain gradient descent: move each weight a small step against its gradient, where $$\eta$$ is the learning rate.
+
+$$w \leftarrow w - \eta \, \frac{\partial L}{\partial w}$$
+
+One full training step, in order:
+
+```python
+logits = model.forward(x)        # (32, 128, 65)
+loss = cross_entropy(logits, y)  # one number
+
+optimizer.zero_grad()            # 1. clear old gradients
+loss.backward()                  # 2. autograd: fills w.grad
+clip_gradients(model.parameters(), grad_clip)  # 3. cap them
+optimizer.step(lr)               # 4. change the weights
+```
+
+1. **Clear the old gradients.** Autograd adds to `w.grad` instead of overwriting it, so the previous step's gradients have to go first.
+2. **Backpropagate.** Fill `w.grad` for all 4.8M weights.
+3. **Clip.** If one unusual batch produces a very large gradient, shrink it to a fixed size. The direction stays the same; only the step is capped.
+4. **Update.** Our code uses **AdamW** instead of plain gradient descent. It follows a running average of each weight's gradients, so one noisy batch can't throw it off, and it scales each weight's step by how large its gradients usually are, so every weight moves at a sensible speed. The "W" also shrinks the weight matrices slightly every step, which keeps them from growing too large.
+
+The learning rate $$\eta$$ also changes during the run. It ramps up over the first 100 steps, while the weights are still random, and then slowly decays from 0.001 to 0.0001, so the steps get smaller as the model settles.
+
+## Conclusion
+
+Put together, the whole model is one pipeline: characters become vectors, 6 layers of attention and MLP add context to them, and the last position is turned into a probability for every possible next character. Training runs the same pass, measures how wrong it was at every position, and nudges every sponge a little.
+
+Learning each piece in isolation gave me some idea of this architecture earlier. But putting it all together in writing (with the help of an LLM, of course) is what helped me see it end to end. Even while writing, I had to stop at many places to understand things better, which was exactly the purpose of this activity.

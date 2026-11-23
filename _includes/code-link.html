@@ -1,0 +1,8 @@
+{% comment %}
+  A small "view in gpt.py ↗" link under a code block, opening GitHub at those lines.
+  Usage (right after a code block): include code-link.html lines="78-86"   (or lines="201")
+  The file comes from the page's front matter:
+    code_url:  GitHub "blob" URL of the file, pinned to a commit so line numbers never drift
+    code_file: name shown in the link (e.g. gpt.py)
+{% endcomment %}{% assign parts = include.lines | split: "-" %}{% assign anchor = "L" | append: parts[0] %}{% if parts[1] %}{% assign anchor = anchor | append: "-L" | append: parts[1] %}{% endif %}
+<div class="code-link"><a href="{{ page.code_url }}#{{ anchor }}" target="_blank" rel="noopener" title="Open these lines of {{ page.code_file }} on GitHub">{{ page.code_file }} · L{{ include.lines | replace: "-", "–" }} ↗</a></div>
